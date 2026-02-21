@@ -10,10 +10,11 @@ Returns four numpy arrays: x_train, y_train, x_val, y_val.
 """
 
 import numpy as np
+import pandas as pd
 from pathlib import Path
 
 DATA_DIR = Path(__file__).parent.parent / "data"
-TSV_FILE = DATA_DIR / "sine_data.tsv"
+TSV_FILE = DATA_DIR / "data.htsv"
 
 # --- Split settings ---
 TRAIN_FRACTION = 0.75
@@ -29,8 +30,8 @@ def load() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     -------
     x_train, y_train, x_val, y_val  — all float64 numpy arrays
     """
-    data = np.loadtxt(TSV_FILE, delimiter="\t", skiprows=1)
-    x, y = data[:, 0], data[:, 1]
+    data = pd.read_csv(TSV_FILE, sep="\t")
+    x, y = data.iloc[:, 0], data.iloc[:, 1]
 
     rng = np.random.default_rng(RANDOM_SEED)
     indices = rng.permutation(len(x))

@@ -1,0 +1,1 @@
+'''Top level entry script. Run FunSearch from here.'''
