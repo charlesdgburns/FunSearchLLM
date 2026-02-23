@@ -37,29 +37,23 @@ def estimate_params(x, y):
 
 
 # ---------------------------------------------------------------------------
-# Seed 2: Reasonable — single sinusoid with naive parameter guess
-# Rationale: correct functional form, parameters need fitting.
+# Seed 2: Another bad guess — just a linear model based on the mean.
 # ---------------------------------------------------------------------------
 
-def model_v2(x, params):
-    """Single sinusoid: A*sin(B*x + C) + D."""
-    A, B, C, D = params
-    return A * np.sin(B * x + C) + D
+def model_v2(x, slope=1, intercept=1):
+    """Basic linear model:"""
+    return slope* x + intercept
 
 
 def estimate_params_v2(x, y):
     """
     Naive initial guess:
-      A ~ half the peak-to-peak range
-      B ~ 1.0 (assume roughly one cycle over the domain)
-      C ~ 0.0 (no phase shift)
-      D ~ mean of y
+      slope ~ half the peak-to-peak range
+      intercept ~ mean of all values
     """
-    A_guess = (np.max(y) - np.min(y)) / 2.0
-    B_guess = 1.0
-    C_guess = 0.0
-    D_guess = np.mean(y)
-    return np.array([A_guess, B_guess, C_guess, D_guess])
+    slope = (np.max(y) - np.min(y)) / 2.0
+    intercept = np.mean(y)
+    return np.array([intercept])
 
 
 # ---------------------------------------------------------------------------

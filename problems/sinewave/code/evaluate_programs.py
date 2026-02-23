@@ -32,15 +32,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "FunSearch"))
 from FunSearch.program_parser import ProgramStrings, strings_to_callables
 
 # --- Penalty weights (set to 0.0 to disable) ---
-PARAM_COUNT_WEIGHT = 0.02
-AST_DEPTH_WEIGHT = 0.005
+PARAM_COUNT_WEIGHT = 1.0
+AST_DEPTH_WEIGHT = 1.0
 
 # --- Optimizer settings ---
 MAX_OPTIMIZER_ITER = 2000
 OPTIMIZER_METHOD = "L-BFGS-B"
 
 # --- Sentinel score returned on failure ---
-FAILURE_SCORE = -999.0
+FAILURE_SCORE = 999.0
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ def evaluate(prog: ProgramStrings, output_dir: Path | None = None) -> tuple[floa
 
     param_penalty = PARAM_COUNT_WEIGHT * n_params
     complexity_penalty = AST_DEPTH_WEIGHT * depth
-    score = -r2 + param_penalty + complexity_penalty
+    score = mse+ param_penalty + complexity_penalty
 
     metrics = {
         "status": "success",
@@ -121,12 +121,16 @@ def evaluate(prog: ProgramStrings, output_dir: Path | None = None) -> tuple[floa
     # --- Optional: save evaluation figure from TRAIN split only ---
     if output_dir is not None:
         try:
+            with open(output_dir/'metrics.json', 'w') as f:
+                json.dump(metrics,f)
+            
             y_train_pred = model_fn(x_train, params_opt)
-            _save_figure(x_train, y_train, y_train_pred, score, output_dir)
+            figure = _save_figure(x_train, y_train, y_train_pred, score, output_dir)
             metrics["figure"] = "evaluation_figure.png"
-        except Exception:
+        except Exception as e:
+            print(f'ERROR SAVING IMAGE:\n {e}')
             pass  # figure failure should never block a score result
-
+    
     return float(score), metrics
 
 
@@ -169,6 +173,7 @@ def _save_figure(x_train, y_train, y_train_pred, score, output_dir: Path):
     fig.tight_layout()
     fig.savefig(output_dir / "evaluation_figure.png", dpi=120)
     plt.close(fig)
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -179,15 +184,19 @@ if __name__ == "__main__":
     from FunSearch.program_parser import script_to_strings
 
     seed_path = Path(__file__).parent / "seed_programs.py"
+    output_path = Path(__file__).parent.parent/"funsearch/gen_0"
+    
     programs = script_to_strings(seed_path)
 
     if not programs:
         print("No seed programs found — check seed_programs.py")
     else:
         for i, prog in enumerate(programs):
+            program_dir = output_path/f'program_{i+1}'
+            program_dir.mkdir(parents=True, exist_ok=True)
             print(f"\n{'='*50}")
             print(f"Seed {i + 1}")
             print(f"{'='*50}")
-            score, metrics = evaluate(prog, output_dir=Path("."))
+            score, metrics = evaluate(prog, output_dir=program_dir)
             print(f"Score  : {score:.4f}")
             print(f"Metrics: {json.dumps(metrics, indent=2)}")

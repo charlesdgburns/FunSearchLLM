@@ -31,7 +31,7 @@ def load() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     x_train, y_train, x_val, y_val  — all float64 numpy arrays
     """
     data = pd.read_csv(TSV_FILE, sep="\t")
-    x, y = data.iloc[:, 0], data.iloc[:, 1]
+    x, y = data.iloc[:, 0].to_numpy(), data.iloc[:, 1].to_numpy()
 
     rng = np.random.default_rng(RANDOM_SEED)
     indices = rng.permutation(len(x))

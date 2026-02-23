@@ -4,43 +4,31 @@ program_parser.py
 Utilities for transforming candidate programs between three representations:
 
   1. SCRIPT  : a .py file with real function definitions (e.g. seed_programs.py)
-  2. STRING  : source code as a plain string (stored in score.json, passed to LLM)
+  2. STRING  : source code as a plain string (stored in program.py, passed to LLM)
   3. CALLABLE: live Python functions ready to call (used by score.py / optimizer)
 
 Three main public functions:
 
-  script_to_strings(path)          -> list of ProgramStrings
-  llm_output_to_strings(text)      -> ProgramStrings | None
-  strings_to_callables(prog)       -> ProgramCallables | None
-
-Plus one convenience dataclass for each representation.
+  script_to_strings(path)       -> list[ProgramStrings]
+  llm_output_to_strings(text)   -> ProgramStrings | None
+  strings_to_callables(prog)    -> ProgramCallables | None
 
 Expected function names in any program:
-  model(x, params)              -> np.ndarray
-  estimate_params(x, y)         -> np.ndarray
-
-These names are enforced at parse time. The LLM prompt should instruct
-the model to use exactly these names.
+  model(x, params)          -> np.ndarray
+  estimate_params(x, y)     -> np.ndarray
 """
 
 import ast
-import inspect
-import textwrap
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Expected function names — change here if the interface ever changes
-# ---------------------------------------------------------------------------
-
 MODEL_NAME = "model"
 ESTIMATOR_NAME = "estimate_params"
 
-# Namespace always injected when executing program strings.
-# Programs that omit 'import numpy as np' will still work.
 _BASE_NAMESPACE: dict = {"np": np}
 
 
@@ -51,15 +39,14 @@ _BASE_NAMESPACE: dict = {"np": np}
 @dataclass
 class ProgramStrings:
     """
-    A candidate program represented as source-code strings.
-    Both strings are self-contained: they include any necessary imports.
-    This is the form stored to disk and passed to the LLM.
+    A candidate program as source-code strings.
+    Both strings are self-contained (include necessary imports).
     """
-    model_src: str          # source of model(x, params)
-    estimator_src: str      # source of estimate_params(x, y)
+    model_src: str
+    estimator_src: str
 
     def combined(self) -> str:
-        """Single string with both functions — used when writing program.py."""
+        """Single string with both functions — written to program.py."""
         return self.model_src + "\n\n" + self.estimator_src
 
     def __repr__(self) -> str:
@@ -68,45 +55,21 @@ class ProgramStrings:
 
 @dataclass
 class ProgramCallables:
-    """
-    A candidate program represented as live callable functions.
-    This is the form used by the optimizer and score.py.
-    """
-    model: Callable           # model(x, params) -> np.ndarray
-    estimate_params: Callable # estimate_params(x, y) -> np.ndarray
-    source: ProgramStrings    # keep the strings around for scoring / logging
+    """A candidate program as live callable functions."""
+    model: Callable
+    estimate_params: Callable
+    source: ProgramStrings
 
 
 # ---------------------------------------------------------------------------
 # 1. SCRIPT -> STRINGS
-#    Parse a real .py file and extract all (model, estimate_params) pairs.
-#    seed_programs.py contains multiple pairs; each becomes one ProgramStrings.
 # ---------------------------------------------------------------------------
 
 def script_to_strings(path: str | Path) -> list[ProgramStrings]:
     """
-    Parse a Python script file and extract all pairs of
-    (model_*, estimate_params_*) functions.
-
-    Functions are matched in order of definition:
-      - first model_* pairs with first estimate_params_*
-      - second model_* pairs with second estimate_params_*, etc.
-
-    Imports from the script are deduplicated and prepended to each function string.
-
-    Parameters
-    ----------
-    path : path to a .py script file
-
-    Returns
-    -------
-    list of ProgramStrings, one per matched pair found in the file.
-    Empty list if no valid pairs are found.
-
-    Example
-    -------
-    >>> programs = script_to_strings("problems/sine/code/seed_programs.py")
-    >>> print(programs[0].model_src)
+    Parse a Python script and extract all (model, estimate_params) pairs.
+    Functions are matched in definition order.
+    Imports are deduplicated and prepended to each function string.
     """
     source = Path(path).read_text()
     try:
@@ -142,37 +105,32 @@ def script_to_strings(path: str | Path) -> list[ProgramStrings]:
 
 # ---------------------------------------------------------------------------
 # 2. LLM OUTPUT -> STRINGS
-#    Extract the two required functions from raw LLM text.
-#    Handles markdown fences, extra prose, and partial outputs gracefully.
 # ---------------------------------------------------------------------------
 
 def llm_output_to_strings(text: str | None) -> ProgramStrings | None:
     """
     Extract model() and estimate_params() from raw LLM output.
 
-    Handles:
-      - Markdown code fences (```python ... ```)
-      - Extra prose before/after the code block
-      - Missing or malformed functions (returns None)
-      - Duplicate imports
+    Strategy:
+      1. If markdown fences are present, extract all fenced blocks and
+         concatenate them (handles functions split across multiple blocks).
+      2. If no fences, isolate the last occurrence of 'def model' and take
+         everything from there — this handles LLMs that echo the full prompt
+         (parent programs + separators) before writing the new program.
+      3. Parse with AST and extract the two canonical functions.
 
-    Parameters
-    ----------
-    text : raw string returned by the LLM API
-
-    Returns
-    -------
-    ProgramStrings if both functions are found, None otherwise.
+    Returns ProgramStrings if both functions found, None otherwise.
     """
     if text is None:
         return None
 
-    code = _strip_markdown(text)
+    code = _isolate_new_program(text)
 
     try:
         module = ast.parse(code)
     except SyntaxError as e:
-        print(f"[program_parser] SyntaxError in LLM output: {e}")
+        print(f"[program_parser] SyntaxError after extraction: {e}")
+        print(f"[program_parser] First 200 chars: {code[:200]!r}")
         return None
 
     imports = _extract_unique_imports(module)
@@ -195,25 +153,14 @@ def llm_output_to_strings(text: str | None) -> ProgramStrings | None:
 
 # ---------------------------------------------------------------------------
 # 3. STRINGS -> CALLABLES
-#    Execute program strings and return live callable functions.
 # ---------------------------------------------------------------------------
 
 def strings_to_callables(prog: ProgramStrings) -> ProgramCallables | None:
     """
     Execute a ProgramStrings and return live callables.
-
-    Both functions are executed in a shared namespace that always includes
-    numpy as 'np', so programs that omit the import still work.
-
-    Parameters
-    ----------
-    prog : ProgramStrings to execute
-
-    Returns
-    -------
-    ProgramCallables if execution succeeds, None otherwise.
+    numpy is always injected as 'np' regardless of imports.
     """
-    namespace = dict(_BASE_NAMESPACE)  # fresh copy each time
+    namespace = dict(_BASE_NAMESPACE)
     combined = prog.combined()
 
     try:
@@ -232,39 +179,72 @@ def strings_to_callables(prog: ProgramStrings) -> ProgramCallables | None:
         print(f"[program_parser] '{ESTIMATOR_NAME}' not found after exec")
         return None
 
-    return ProgramCallables(
-        model=model_fn,
-        estimate_params=est_fn,
-        source=prog,
-    )
+    return ProgramCallables(model=model_fn, estimate_params=est_fn, source=prog)
 
 
 # ---------------------------------------------------------------------------
-# Convenience: script path -> callables (combines steps 1 and 3)
+# Convenience
 # ---------------------------------------------------------------------------
 
 def script_to_callables(path: str | Path) -> list[ProgramCallables]:
-    """
-    Parse a script file and return all programs as live callables.
-    Convenience wrapper around script_to_strings + strings_to_callables.
-    """
-    programs = script_to_strings(path)
-    callables = []
-    for prog in programs:
-        c = strings_to_callables(prog)
-        if c is not None:
-            callables.append(c)
-    return callables
+    """Parse a script and return all programs as live callables."""
+    return [c for p in script_to_strings(path)
+            if (c := strings_to_callables(p)) is not None]
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _isolate_new_program(text: str) -> str:
+    """
+    Extract clean Python code from raw LLM output.
+
+    If markdown fences are present, extract all fenced blocks and concatenate
+    them — this handles functions split across multiple blocks.
+
+    If no fences, find the LAST 'def model' in the text and take everything
+    from the nearest preceding import onward. This handles the common LLM
+    pattern of echoing all parent programs before writing the new one.
+    """
+    # --- Path 1: markdown fences present ---
+    fence_pattern = re.compile(
+        r'^\s*```(?:python|py)?\s*\n(.*?)^\s*```',
+        re.MULTILINE | re.DOTALL,
+    )
+    blocks = fence_pattern.findall(text)
+    if blocks:
+        return "\n\n".join(block.strip() for block in blocks)
+
+    # --- Path 2: no fences — isolate from last def model onward ---
+    lines = text.splitlines()
+
+    # Find the last zero-indented 'def model'
+    last_model_line = None
+    for i, line in enumerate(lines):
+        if re.match(r'^def model', line):
+            last_model_line = i
+
+    if last_model_line is None:
+        # No def model found at all — return as-is for error reporting
+        return re.sub(r'`+', '', text).strip()
+
+    # Walk backward from def model to pick up any preceding imports
+    start = last_model_line
+    for i in range(last_model_line - 1, -1, -1):
+        line = lines[i].strip()
+        if re.match(r'^(import |from )', lines[i]):
+            start = i
+        elif line == '':
+            continue
+        else:
+            break
+
+    return "\n".join(lines[start:])
+
+
 def _extract_unique_imports(module: ast.Module) -> list[ast.stmt]:
-    """Return deduplicated import nodes from a parsed module."""
-    seen = set()
-    unique = []
+    seen, unique = set(), []
     for node in module.body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             src = ast.unparse(node)
@@ -278,17 +258,13 @@ def _find_function(
     funcs: dict[str, ast.FunctionDef],
     name: str,
 ) -> ast.FunctionDef | None:
-    """
-    Find a function node by exact name, then by prefix match.
-    Renames the node to the canonical name before returning.
-    """
+    """Find by exact name, then by prefix. Renames to canonical."""
     node = funcs.get(name)
     if node is None:
-        # Try prefix match (e.g. 'model_v2' -> 'model')
         candidates = [n for k, n in funcs.items() if k.startswith(name)]
         node = candidates[0] if candidates else None
     if node is not None:
-        node.name = name  # normalise to canonical name
+        node.name = name
     return node
 
 
@@ -297,39 +273,10 @@ def _node_to_src(
     func_node: ast.FunctionDef,
     canonical_name: str,
 ) -> str:
-    """Build a self-contained source string: imports + renamed function."""
     func_node.name = canonical_name
     mini_module = ast.Module(body=imports + [func_node], type_ignores=[])
     ast.fix_missing_locations(mini_module)
     return ast.unparse(mini_module)
-
-
-def _strip_markdown(text: str) -> str:
-    """
-    Remove markdown code fences and leading/trailing prose.
-    Extracts the content of the first ```python ... ``` block if present,
-    otherwise returns the full text stripped of fence markers.
-    """
-    lines = text.splitlines()
-
-    # Find first ```python or ``` fence
-    in_block = False
-    block_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if not in_block and stripped.startswith("```"):
-            in_block = True
-            continue  # skip the opening fence line
-        if in_block and stripped.startswith("```"):
-            break  # end of block
-        if in_block:
-            block_lines.append(line)
-
-    if block_lines:
-        return "\n".join(block_lines)
-
-    # No fences found — return full text, stripping any stray backticks
-    return text.replace("```", "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -337,10 +284,8 @@ def _strip_markdown(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # --- Test LLM output parsing ---
-    fake_llm_output = """
-Here is my improved function:
-
+    print("=== Test 1: clean single block ===")
+    prog = llm_output_to_strings("""
 ```python
 import numpy as np
 
@@ -351,27 +296,51 @@ def model(x, params):
 def estimate_params(x, y):
     return np.array([(np.max(y) - np.min(y)) / 2, 1.0, 0.0, np.mean(y)])
 ```
+""")
+    print("Parsed:", prog is not None)
 
-This should fit better because of the phase term.
-"""
+    print("\n=== Test 2: split across two fenced blocks ===")
+    prog = llm_output_to_strings("""
+Here is the model:
+```python
+import numpy as np
+def model(x, params):
+    A, B, C, D = params
+    return A * np.sin(B * x + C) + D
+```
+And the estimator:
+```python
+def estimate_params(x, y):
+    return np.array([(np.max(y) - np.min(y)) / 2, 1.0, 0.0, np.mean(y)])
+```
+""")
+    print("Parsed:", prog is not None)
 
-    print("=== Test: llm_output_to_strings ===")
-    prog = llm_output_to_strings(fake_llm_output)
+    print("\n=== Test 3: full prompt echo (no fences) ===")
+    prog = llm_output_to_strings("""loss of model 3: 0.0412
+import numpy as np
+def model(x, params):
+    \"\"\"Linear model.\"\"\"
+    A, B = params
+    return A * x + B
+import numpy as np
+def estimate_params(x, y):
+    A_guess = (y[1] - y[0]) / (x[1] - x[0]) if (x[1] - x[0]) != 0 else 0
+    return np.array([A_guess, 0.0])
+----------------------------
+loss of model 4: 0.0321
+import numpy as np
+def model(x, params):
+    \"\"\"Quadratic model.\"\"\"
+    A, B, C = params
+    return A * x**2 + B * x + C
+import numpy as np
+def estimate_params(x, y):
+    return np.array([1.0, 0.0, 0.0])""")
+    print("Parsed:", prog is not None)
     if prog:
-        print("model_src:\n", prog.model_src)
-        print("\nestimator_src:\n", prog.estimator_src)
+        print("Is quadratic (last model taken):", "A, B, C" in prog.model_src)
 
-    print("\n=== Test: strings_to_callables ===")
-    callables = strings_to_callables(prog)
-    if callables:
-        x = np.linspace(-3, 3, 10)
-        params = np.array([2.5, 1.3, 0.8, -1.0])
-        y_pred = callables.model(x, params)
-        p0 = callables.estimate_params(x, y_pred)
-        print(f"model output shape : {y_pred.shape}")
-        print(f"estimate_params p0 : {p0}")
-
-    print("\n=== Test: missing function ===")
-    bad_output = "def model(x, params):\n    return params[0]"
-    result = llm_output_to_strings(bad_output)
-    print(f"Result (should be None): {result}")
+    print("\n=== Test 4: missing estimate_params ===")
+    prog = llm_output_to_strings("def model(x, params):\n    return params[0]")
+    print(f"Result (should be None): {prog}")
