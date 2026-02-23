@@ -132,7 +132,7 @@ Do not use curve_fit, minimize, or any iterative fitting.
     if use_image:
         prompt += """
 **Image Analysis Instructions:**
-Attached are scatter plots where the data is plotted and each model curve is drawn **using the functions shown below**.
+Attached are plots where the data (red scatterpoints) is plotted and each model curve (gray line) is drawn.
 Pay close attention to the data and what kind of model() function may fit it.
 Then focus on how the parameter values affect model fit, and how estimate_params() can improve the model() fit.
 

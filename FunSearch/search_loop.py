@@ -61,8 +61,8 @@ class Config:
     # Annealing schedule: temperature declines linearly from explore -> exploit
     # over all generations. Mode switches from explore to exploit once the
     # temperature crosses mode_threshold.
-    temperature_explore: float = 1.2
-    temperature_exploit: float = 0.6
+    temperature_explore: float = 1.5
+    temperature_exploit: float = 0.5
     mode_threshold: float = 1.0   # temperature below this -> exploit
 
     use_image: bool = True
@@ -189,9 +189,7 @@ def initialise_islands(config: Config) -> None:
             score, metrics = score_fn(prog, output_dir=program_dir)
             _write_score(metrics, program_dir)
             print(f"score={score:.4f}  status={metrics['status']}")
-            if k==1:
-                print(f'PROMPT: {segments}')
-
+            
 # ---------------------------------------------------------------------------
 # Main evolution loop
 # ---------------------------------------------------------------------------
@@ -245,7 +243,7 @@ def run_evolution(config: Config) -> None:
             prog, fail_reason = _parse_response(response)
 
             if prog is None:
-                island_manager.save_failed(config.funsearch_dir, response, fail_reason, prompt=prompt)
+                island_manager.save_failed(config.funsearch_dir, response, fail_reason, prompt=None)
                 print(f"FAILED ({fail_reason})")
                 continue
 
@@ -257,7 +255,11 @@ def run_evolution(config: Config) -> None:
             score, metrics = score_fn(prog, output_dir=program_dir)
             _write_score(metrics, program_dir)
             print(f"score={score:.4f}  status={metrics['status']}")
-
+            if k==1:
+                prompt_segments = [x[0] for x in segments]
+                full_prompt = ''.join(prompt_segments)
+                print(f'PROMPT: \n {full_prompt}')
+    
         # Prune and deduplicate
         df = island_manager.build_dataframe(config.funsearch_dir)
         for k in range(1, config.n_islands + 1):
@@ -380,10 +382,10 @@ def _write_score(metrics: dict, program_dir: Path) -> None:
 if __name__ == "__main__":
     config = Config(
         problem_dir=Path("problems/sinewave"),
-        n_islands=8,
-        n_programs_per_generation=6,
+        n_islands=4,
+        n_programs_per_generation=8,
         n_generations=20,
-        max_population=10,
+        max_population=12,
         migrate_every=2,
         use_image=True,
         provider="google",

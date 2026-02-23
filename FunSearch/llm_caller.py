@@ -41,7 +41,7 @@ Provider = Literal["anthropic", "google"]
 
 DEFAULT_MODELS: dict[Provider, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
-    "google": "gemma-3-27b-it",
+    "google": "gemma-3-27b-it", # "gemini-2.5-flash", #
 }
 
 MAX_OUTPUT_TOKENS = 5_000

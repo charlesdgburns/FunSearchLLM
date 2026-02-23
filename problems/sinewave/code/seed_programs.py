@@ -40,20 +40,16 @@ def estimate_params(x, y):
 # Seed 2: Another bad guess — just a linear model based on the mean.
 # ---------------------------------------------------------------------------
 
-def model_v2(x, slope=1, intercept=1):
-    """Basic linear model:"""
-    return slope* x + intercept
+def model_v2(x, params):
+    """Be creative and invent your own model! 
+    What pattern do you think would fit the data?"""
+    return x
 
 
 def estimate_params_v2(x, y):
+    """Estimate the parameters using features from the data shown in the scatterplot.
     """
-    Naive initial guess:
-      slope ~ half the peak-to-peak range
-      intercept ~ mean of all values
-    """
-    slope = (np.max(y) - np.min(y)) / 2.0
-    intercept = np.mean(y)
-    return np.array([intercept])
+    return None
 
 
 # ---------------------------------------------------------------------------
