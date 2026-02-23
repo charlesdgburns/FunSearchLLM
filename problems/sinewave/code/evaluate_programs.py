@@ -32,8 +32,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "FunSearch"))
 from FunSearch.program_parser import ProgramStrings, strings_to_callables
 
 # --- Penalty weights (set to 0.0 to disable) ---
-PARAM_COUNT_WEIGHT = 1.0
-AST_DEPTH_WEIGHT = 1.0
+PARAM_COUNT_WEIGHT = 0.1
+AST_DEPTH_WEIGHT = 0.01
 
 # --- Optimizer settings ---
 MAX_OPTIMIZER_ITER = 2000
@@ -103,7 +103,7 @@ def evaluate(prog: ProgramStrings, output_dir: Path | None = None) -> tuple[floa
 
     param_penalty = PARAM_COUNT_WEIGHT * n_params
     complexity_penalty = AST_DEPTH_WEIGHT * depth
-    score = mse+ param_penalty + complexity_penalty
+    score = mse + param_penalty + complexity_penalty
 
     metrics = {
         "status": "success",
@@ -163,9 +163,10 @@ def _failure_metrics(reason: str) -> dict:
 def _save_figure(x_train, y_train, y_train_pred, score, output_dir: Path):
     sort_idx = np.argsort(x_train)
     fig, ax = plt.subplots(figsize=(8, 4))
-    ax.scatter(x_train, y_train, s=10, alpha=0.5, label="train data")
+    ax.scatter(x_train, y_train, s=10, alpha=0.5, color= "crimson", label="train data")
     ax.plot(x_train[sort_idx], y_train_pred[sort_idx],
-            color="crimson", linewidth=2, label=f"model (score={score:.4f})")
+            color="gray", linewidth=2, label=f"model (score={score:.4f})",
+            alpha = 0.3)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_title("Model fit — training data only")

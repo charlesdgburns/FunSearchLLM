@@ -102,6 +102,7 @@ def build_dataframe(funsearch_dir: Path) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     df = df.sort_values("score", ascending=True).reset_index(drop=True)
+    df.to_csv(funsearch_dir/'model_rankings.htsv', sep='\t')
     return df
 
 
@@ -109,6 +110,7 @@ def save_failed(
     funsearch_dir: Path,
     raw_response: str | None,
     reason: str,
+    prompt: str | None,
 ) -> None:
     """
     Save a failed LLM response to funsearch/failed/ for manual inspection.
@@ -130,6 +132,9 @@ def save_failed(
     # Write reason
     (program_dir / "reason.txt").write_text(reason)
 
+    #Write prompt if available
+    if prompt is not None:
+        (program_dir/"raw_response.txt").write_text(prompt)
     # Write raw LLM response if available
     if raw_response is not None:
         (program_dir / "raw_response.txt").write_text(raw_response)
@@ -180,8 +185,7 @@ def select_parents(
 
     # Softmax-weighted sampling without replacement
     scores = top_half["score"].values.astype(float)
-    shifted = scores - scores.max()
-    weights = np.exp(shifted)
+    weights = np.exp(1/scores)
     weights /= weights.sum()
 
     chosen_idx = rng.choice(len(top_half), size=n_parents, replace=False, p=weights)

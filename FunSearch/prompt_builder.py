@@ -34,21 +34,29 @@ def build_prompt(
     parents: list[tuple[ProgramStrings, float]],
     mode: Mode,
     context: str,
-) -> str:
+    image_paths: list[Path | None] | None = None,
+    use_image: bool = True,
+) -> list[tuple[str, list[Path] | None]]:
     """
-    Create a prompt to generate a new model and estimate_params based on
-    2 existing programs, following EDGAR's linked prompt design.
+    Build an interleaved prompt for the LLM as a list of (text, images) segments.
+
+    Segment order:
+      1. Task instructions + output format (+ image analysis note if use_image)
+      2. Parent program 1 text [+ figure 1 if use_image and available]
+      3. Parent program 2 text [+ figure 2 if use_image and available]
 
     Parameters
     ----------
-    parents : list of exactly 2 (ProgramStrings, score) tuples,
-              ordered worst-first so the LLM sees a clear improvement direction
-    mode    : "explore" or "exploit"
-    context : problem description string (from prompt_context.txt)
+    parents     : list of exactly 2 (ProgramStrings, score) tuples,
+                  ordered worst-first so the LLM sees a clear improvement direction
+    mode        : "explore" or "exploit"
+    context     : problem description string (from prompt_context.txt)
+    image_paths : optional list of 2 Path-or-None values, one per parent
+    use_image   : whether to include evaluation figures in the prompt
 
     Returns
     -------
-    Prompt string ready to send to the LLM.
+    List of (text, image_paths) segments for llm_caller.call_interleaved().
     """
     assert len(parents) == 2, "build_prompt expects exactly 2 parent programs"
     assert mode in ("explore", "exploit"), f"Unknown mode: {mode!r}"
@@ -63,7 +71,7 @@ Your task is to create a new model() and the associated estimate_params() \
 that has a lower loss than the models below.
 
 *Analyze* the progression of the models, *generalize* the improvements, \
-and *create* a new model that is better than the *all* previous models.
+and *create* a new model that is better than *all* previous models.
 
 """
 
@@ -85,26 +93,65 @@ models and *eliminating* their weaknesses or *redundancies*. You will be \
 
 """
 
-    prompt += """\
-**Code Generation Guidelines:**
-* Import any packages you use.
-* Do not include any text other than the code.
-* Ensure all free parameters are numeric, not strings.
-* The functions must be named exactly `model` and `estimate_params`.
-* `model(x, params)` takes an array of inputs and a parameter vector, \
-and returns predicted outputs.
-* `estimate_params(x, y)` takes inputs and observed outputs, and returns \
-an initial parameter guess. Do not use curve_fit, minimize, or any iterative \
-fitting — this is a starting point for gradient-based optimisation.
+    prompt += """**Output format — strictly follow this:**
+Output a SINGLE fenced Python code block containing ONLY the two new functions.
+
+```python
+import numpy as np
+
+def model(x, params):
+    # your implementation
+    ...
+
+def estimate_params(x, y):
+    # your implementation
+    ...
+```
+
+**Code guidelines:**
+* Import packages inside the code block.
+* Name the functions exactly `model` and `estimate_params` — no version suffixes.
+* `model(x, params)`: x and params are np.ndarrays, return np.ndarray of predictions.
+* `estimate_params(x, y)`: return an initial parameter guess as np.ndarray. \
+Do not use curve_fit, minimize, or any iterative fitting.
+* All free parameters must be numeric, not strings.
 
 """
 
-    for i, (prog, score) in enumerate(parents):
-        prompt += f"loss of model {i + 1}: {score:.4f}\n"
-        prompt += f"```python {prog.model_src}```\n\n"
-        prompt += f"```python {prog.estimator_src}```\n"
+    # Resolve image paths — None if not provided or use_image is False
+    n = len(parents)
+    imgs: list[Path | None] = []
+    if use_image and image_paths:
+        for i in range(n):
+            p = image_paths[i] if i < len(image_paths) else None
+            imgs.append(Path(p) if p is not None else None)
+    else:
+        imgs = [None] * n
 
-    return prompt.strip()
+    # Append image analysis instructions to the task prompt if using images
+    if use_image:
+        prompt += """
+**Image Analysis Instructions:**
+Attached are scatter plots where the data is plotted and each model curve is drawn **using the functions shown below**.
+Pay close attention to the data and what kind of model() function may fit it.
+Then focus on how the parameter values affect model fit, and how estimate_params() can improve the model() fit.
+
+"""
+
+    # Segment 1: task instructions (no image — sent first so the LLM reads
+    # the objective before seeing the programs)
+    segments: list[tuple[str, list[Path] | None]] = [(prompt, None)]
+
+    # One segment per parent: program text [+ figure if available]
+    for i, (prog, score) in enumerate(parents):
+        parent_text = f"loss of model {i + 1}: {score:.4f}\n"
+        parent_text += f"{prog.model_src}\n\n"
+        parent_text += f"{prog.estimator_src}\n"
+        parent_text += "\n----------------------------\n"
+        img = [imgs[i]] if imgs[i] is not None else None
+        segments.append((parent_text, img))
+
+    return segments
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +167,10 @@ def load_context(problem_code_dir: Path) -> str:
     if context_path.exists():
         return context_path.read_text().strip()
     print(f"[prompt_builder] Warning: no prompt_context.txt found at {context_path}")
-    return ("")
+    return (
+        "You are an AI scientist performing symbolic regression. "
+        "Your goal is to discover a compact mathematical function that fits the data well."
+    )
 
 
 # ---------------------------------------------------------------------------

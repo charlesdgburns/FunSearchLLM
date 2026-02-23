@@ -4,19 +4,18 @@ llm_caller.py
 Async LLM API client supporting Anthropic and Google Gemini.
 
 Usage:
-    from FunSearch.llm_caller import LLMCaller
-
     caller = LLMCaller(provider="google")
-    response = await caller.call("your prompt here")
+    response = await caller.call("your prompt", image_paths=[Path("fig1.png"), Path("fig2.png")])
 
-    # With an image:
-    response = await caller.call("describe this", image_path=Path("figure.png"))
+    # Synchronous (for testing only):
+    response = caller.call_sync("your prompt", image_paths=[...])
 
-API keys are loaded from a .env file in the project root:
+Multiple images are supported and interleaved with prompt text segments
+when using build_prompt() from prompt_builder.py.
+
+API keys are loaded from a .env file:
     ANTHROPIC_API_KEY=...
     GOOGLE_API_KEY=...
-
-Synchronous calls are available via caller.call_sync(...) for testing.
 """
 
 import os
@@ -42,7 +41,7 @@ Provider = Literal["anthropic", "google"]
 
 DEFAULT_MODELS: dict[Provider, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
-    "google": "gemma-3-27b-it", #"gemini-2.5-flash",
+    "google": "gemma-3-27b-it",
 }
 
 MAX_OUTPUT_TOKENS = 5_000
@@ -51,12 +50,13 @@ MAX_OUTPUT_TOKENS = 5_000
 class LLMCaller:
     """
     Thin async wrapper around Anthropic and Google Gemini APIs.
+    Supports multi-image prompts for visual feedback on model fits.
 
     Parameters
     ----------
-    provider    : "anthropic" or "google" (default: "google" — free tier available)
-    model       : model name string; defaults to a sensible cheap model per provider
-    temperature : sampling temperature (higher = more creative / exploratory)
+    provider    : "anthropic" or "google" (default: "google")
+    model       : model name; defaults to a sensible cheap model per provider
+    temperature : sampling temperature
     """
 
     def __init__(
@@ -77,49 +77,95 @@ class LLMCaller:
     async def call(
         self,
         prompt: str,
-        image_path: Path | None = None,
+        image_paths: list[Path] | None = None,
     ) -> str | None:
         """
-        Send a prompt asynchronously and return the response text.
+        Send a prompt with optional images and return the response text.
+
+        Images are appended after the prompt text in the order given.
+        To interleave images with text segments, use call_interleaved().
 
         Parameters
         ----------
-        prompt     : text prompt to send
-        image_path : optional path to a PNG image to include alongside the prompt
+        prompt      : text prompt to send
+        image_paths : optional list of PNG image paths to include
 
         Returns
         -------
-        Response text string, or None on failure.
+        Response text, or None on failure.
         """
-        image_bytes = _load_image(image_path)
+        images = _load_images(image_paths)
         if self.provider == "anthropic":
-            return await self._call_anthropic(prompt, image_bytes)
+            return await self._call_anthropic([(prompt, images)])
         else:
-            return await self._call_google(prompt, image_bytes)
+            return await self._call_google([(prompt, images)])
 
-    def call_sync(self, prompt: str, image_path: Path | None = None) -> str | None:
+    async def call_interleaved(
+        self,
+        segments: list[tuple[str, list[Path] | None]],
+    ) -> str | None:
         """
-        Synchronous wrapper around call() — convenient for testing.
-        Avoid using this inside an already-running event loop.
+        Send a prompt built from interleaved text and image segments.
+
+        Each segment is a (text, image_paths) tuple. This allows images to
+        appear between text sections rather than all at the end — useful for
+        associating each evaluation figure with its corresponding program.
+
+        Parameters
+        ----------
+        segments : list of (text, image_paths) tuples. image_paths may be None.
+
+        Returns
+        -------
+        Response text, or None on failure.
         """
-        return asyncio.run(self.call(prompt, image_path=image_path))
+        loaded = [(text, _load_images(paths)) for text, paths in segments]
+        if self.provider == "anthropic":
+            return await self._call_anthropic(loaded)
+        else:
+            return await self._call_google(loaded)
+
+    def call_sync(
+        self,
+        prompt: str,
+        image_paths: list[Path] | None = None,
+    ) -> str | None:
+        """Synchronous wrapper — for testing only, not for use in async loops."""
+        return asyncio.run(self.call(prompt, image_paths=image_paths))
+
+    def call_interleaved_sync(
+        self,
+        segments: list[tuple[str, list[Path] | None]],
+    ) -> str | None:
+        """Synchronous wrapper around call_interleaved."""
+        return asyncio.run(self.call_interleaved(segments))
 
     # ------------------------------------------------------------------
     # Provider implementations
     # ------------------------------------------------------------------
 
-    async def _call_anthropic(self, prompt: str, image_bytes: bytes | None) -> str | None:
+    async def _call_anthropic(
+        self,
+        segments: list[tuple[str, list[bytes]]],
+    ) -> str | None:
+        """
+        Build an Anthropic content list from interleaved text/image segments.
+        Images are inserted before their associated text segment.
+        """
         try:
-            content: list = [{"type": "text", "text": prompt}]
-            if image_bytes is not None:
-                content.insert(0, {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": base64.b64encode(image_bytes).decode(),
-                    },
-                })
+            content: list[dict] = []
+            for text, images in segments:
+                for img_bytes in images:
+                    content.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": base64.b64encode(img_bytes).decode(),
+                        },
+                    })
+                content.append({"type": "text", "text": text})
+
             response = await self._client.messages.create(
                 model=self.model,
                 max_tokens=MAX_OUTPUT_TOKENS,
@@ -131,15 +177,26 @@ class LLMCaller:
             print(f"[llm_caller] Anthropic error: {e}")
             return None
 
-    async def _call_google(self, prompt: str, image_bytes: bytes | None) -> str | None:
+    async def _call_google(
+        self,
+        segments: list[tuple[str, list[bytes]]],
+    ) -> str | None:
+        """
+        Build a Google contents list from interleaved text/image segments.
+        Images are inserted before their associated text segment.
+        """
         try:
             config = types.GenerateContentConfig(
                 temperature=self.temperature,
                 max_output_tokens=MAX_OUTPUT_TOKENS,
             )
-            contents: list = [prompt]
-            if image_bytes is not None:
-                contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/png"))
+            contents: list = []
+            for text, images in segments:
+                for img_bytes in images:
+                    contents.append(
+                        types.Part.from_bytes(data=img_bytes, mime_type="image/png")
+                    )
+                contents.append(text)
 
             response = await self._client.aio.models.generate_content(
                 model=self.model,
@@ -169,22 +226,25 @@ class LLMCaller:
             return genai.Client(api_key=api_key)
 
         else:
-            raise ValueError(f"Unknown provider: {self.provider!r}. Choose 'anthropic' or 'google'.")
+            raise ValueError(f"Unknown provider: {self.provider!r}.")
 
 
 # ------------------------------------------------------------------
 # Internal helpers
 # ------------------------------------------------------------------
 
-def _load_image(image_path: Path | None) -> bytes | None:
-    """Read image bytes from a path, or return None if no path given."""
-    if image_path is None:
-        return None
-    image_path = Path(image_path)
-    if not image_path.exists():
-        print(f"[llm_caller] Image not found: {image_path}")
-        return None
-    return image_path.read_bytes()
+def _load_images(image_paths: list[Path] | None) -> list[bytes]:
+    """Load a list of image paths into bytes. Skips missing files with a warning."""
+    if not image_paths:
+        return []
+    result = []
+    for p in image_paths:
+        p = Path(p)
+        if not p.exists():
+            print(f"[llm_caller] Image not found, skipping: {p}")
+            continue
+        result.append(p.read_bytes())
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +259,7 @@ if __name__ == "__main__":
     print(f"Model            : {DEFAULT_MODELS[provider]}\n")
 
     caller = LLMCaller(provider=provider, temperature=0.5)
-    response = caller.call_sync("Sending love.")
+    response = caller.call_sync("Reply with exactly three words.")
 
     if response:
         print(f"Response: {response}")

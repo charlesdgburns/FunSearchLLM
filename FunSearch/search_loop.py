@@ -55,14 +55,17 @@ class Config:
     migrate_every: int = 5
     n_migrate: int = 1
 
-    # Mode schedule cycles over generations
-    mode_schedule: list[Mode] = field(default_factory=lambda: ["explore", "exploit"])
-
     provider: str = "google"
     model: str | None = None
+
+    # Annealing schedule: temperature declines linearly from explore -> exploit
+    # over all generations. Mode switches from explore to exploit once the
+    # temperature crosses mode_threshold.
     temperature_explore: float = 1.2
     temperature_exploit: float = 0.6
+    mode_threshold: float = 1.0   # temperature below this -> exploit
 
+    use_image: bool = True
     random_seed: int = 42
 
     @property
@@ -80,11 +83,16 @@ class Config:
     def island_dir(self, k: int) -> Path:
         return self.funsearch_dir / f"island_{k}"
 
-    def mode_for(self, generation: int) -> Mode:
-        return self.mode_schedule[generation % len(self.mode_schedule)]
+    def temperature_for(self, generation: int) -> float:
+        """Linearly anneal from temperature_explore to temperature_exploit."""
+        if self.n_generations <= 1:
+            return self.temperature_explore
+        t = generation / (self.n_generations - 1)   # 0.0 -> 1.0
+        return self.temperature_explore + t * (self.temperature_exploit - self.temperature_explore)
 
-    def temperature_for(self, mode: Mode) -> float:
-        return self.temperature_explore if mode == "explore" else self.temperature_exploit
+    def mode_for(self, generation: int) -> Mode:
+        """Explore while temperature is above threshold, exploit below."""
+        return "explore" if self.temperature_for(generation) >= self.mode_threshold else "exploit"
 
 
 # ---------------------------------------------------------------------------
@@ -162,14 +170,14 @@ def initialise_islands(config: Config) -> None:
 
         for j in range(config.n_programs_per_generation):
             parents = _sample_two(seed_parents, rng)
-            prompt = build_prompt(parents, mode="explore", context=context)
+            segments = build_prompt(parents, mode="explore", context=context, use_image=config.use_image)
             print(f"    [{island_name}] program {j + 1}/{config.n_programs_per_generation} ...", end=" ", flush=True)
 
-            response = caller.call_sync(prompt)
+            response = caller.call_interleaved_sync(segments)
             prog, fail_reason = _parse_response(response)
 
             if prog is None:
-                island_manager.save_failed(config.funsearch_dir, response, fail_reason)
+                island_manager.save_failed(config.funsearch_dir, response, fail_reason, prompt=None)
                 print(f"FAILED ({fail_reason})")
                 continue
 
@@ -181,7 +189,8 @@ def initialise_islands(config: Config) -> None:
             score, metrics = score_fn(prog, output_dir=program_dir)
             _write_score(metrics, program_dir)
             print(f"score={score:.4f}  status={metrics['status']}")
-
+            if k==1:
+                print(f'PROMPT: {segments}')
 
 # ---------------------------------------------------------------------------
 # Main evolution loop
@@ -198,9 +207,9 @@ def run_evolution(config: Config) -> None:
     rng = np.random.default_rng(config.random_seed + 1)
 
     for gen in range(config.n_generations):
+        temperature = config.temperature_for(gen)
         mode = config.mode_for(gen)
-        temperature = config.temperature_for(mode)
-        print(f"\n--- Generation {gen + 1}/{config.n_generations}  mode={mode}  temp={temperature} ---")
+        print(f"\n--- Generation {gen + 1}/{config.n_generations}  mode={mode}  temp={temperature:.3f} ---")
 
         df = island_manager.build_dataframe(config.funsearch_dir)
         island_manager.print_summary(df)
@@ -226,18 +235,17 @@ def run_evolution(config: Config) -> None:
                 print(f"  [{island_name}] Could not load parent programs from disk, skipping.")
                 continue
 
-            # Optionally include the best parent's evaluation figure
-            best_row = max(parent_rows, key=lambda r: r["score"])
-            image_path = best_row.get("image_dir")
+            # Collect evaluation figures for each parent (worst-first order)
+            image_paths = [row.get("image_dir") for row in parent_rows]
 
-            prompt = build_prompt(parents, mode=mode, context=context)
+            segments = build_prompt(parents, mode=mode, context=context, image_paths=image_paths, use_image=config.use_image)
             print(f"  [{island_name}] Generating ...", end=" ", flush=True)
 
-            response = caller.call_sync(prompt, image_path=image_path)
+            response = caller.call_interleaved_sync(segments)
             prog, fail_reason = _parse_response(response)
 
             if prog is None:
-                island_manager.save_failed(config.funsearch_dir, response, fail_reason)
+                island_manager.save_failed(config.funsearch_dir, response, fail_reason, prompt=prompt)
                 print(f"FAILED ({fail_reason})")
                 continue
 
@@ -269,7 +277,7 @@ def run_evolution(config: Config) -> None:
     island_manager.print_summary(df)
     successful = df[df["status"] == "success"]
     if not successful.empty:
-        best = successful.iloc[0] #the dataframe is sorted in ascending, so ranking best first.
+        best = successful.iloc[0]
         print(f"Best program : {best['island']}/{best['program']}  score={best['score']:.4f}")
         print(f"Location     : {best['program_dir']}")
 
@@ -290,9 +298,9 @@ def run(config: Config) -> None:
 # ---------------------------------------------------------------------------
 
 def _load_score_fn(config: Config):
-    """Dynamically import score.evaluate from the problem's code directory."""
+    """Dynamically import evaluate from the problem's evaluate_programs.py."""
     score_path = config.code_dir / "evaluate_programs.py"
-    spec = importlib.util.spec_from_file_location("score", score_path)
+    spec = importlib.util.spec_from_file_location("evaluate_programs", score_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.evaluate
@@ -372,11 +380,12 @@ def _write_score(metrics: dict, program_dir: Path) -> None:
 if __name__ == "__main__":
     config = Config(
         problem_dir=Path("problems/sinewave"),
-        n_islands=4,
+        n_islands=8,
         n_programs_per_generation=6,
-        n_generations=10,
+        n_generations=20,
         max_population=10,
         migrate_every=2,
+        use_image=True,
         provider="google",
         random_seed=42,
     )
@@ -386,6 +395,7 @@ if __name__ == "__main__":
     print(f"  Islands     : {config.n_islands}")
     print(f"  Programs/gen: {config.n_programs_per_generation}")
     print(f"  Generations : {config.n_generations}")
+    print(f"  Use images  : {config.use_image}")
     print(f"  Provider    : {config.provider}")
 
     run(config)
