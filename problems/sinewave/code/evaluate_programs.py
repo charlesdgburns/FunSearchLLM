@@ -165,7 +165,7 @@ def _save_figure(x_train, y_train, y_train_pred, score, output_dir: Path):
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.scatter(x_train, y_train, s=10, alpha=0.5, color= "crimson", label="train data")
     ax.plot(x_train[sort_idx], y_train_pred[sort_idx],
-            color="gray", linewidth=2, label=f"model (score={score:.4f})",
+            color="gray", linewidth=2, label=f"model (loss={score:.4f})",
             alpha = 0.3)
     ax.set_xlabel("x")
     ax.set_ylabel("y")

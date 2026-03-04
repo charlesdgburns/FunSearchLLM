@@ -35,7 +35,7 @@ from FunSearch.program_parser import (
     script_to_strings,
     llm_output_to_strings,
 )
-from FunSearch.prompt_builder import build_prompt, load_context
+from FunSearch.prompt_builder import build_prompt, build_seed_prompt, load_context
 
 Mode = Literal["explore", "exploit"]
 
@@ -61,10 +61,11 @@ class Config:
     # Annealing schedule: temperature declines linearly from explore -> exploit
     # over all generations. Mode switches from explore to exploit once the
     # temperature crosses mode_threshold.
-    temperature_explore: float = 1.5
-    temperature_exploit: float = 0.5
+    temperature_explore: float = 1.2
+    temperature_exploit: float = 0.6
     mode_threshold: float = 1.0   # temperature below this -> exploit
 
+    use_seed_programs: bool = True   # False -> LLM generates seeds from data plot
     use_image: bool = True
     random_seed: int = 42
 
@@ -177,7 +178,7 @@ def initialise_islands(config: Config) -> None:
             prog, fail_reason = _parse_response(response)
 
             if prog is None:
-                island_manager.save_failed(config.funsearch_dir, response, fail_reason, prompt=None)
+                island_manager.save_failed(config.funsearch_dir, response, fail_reason, prompt=prompt)
                 print(f"FAILED ({fail_reason})")
                 continue
 
@@ -189,7 +190,8 @@ def initialise_islands(config: Config) -> None:
             score, metrics = score_fn(prog, output_dir=program_dir)
             _write_score(metrics, program_dir)
             print(f"score={score:.4f}  status={metrics['status']}")
-            
+
+
 # ---------------------------------------------------------------------------
 # Main evolution loop
 # ---------------------------------------------------------------------------
@@ -243,7 +245,7 @@ def run_evolution(config: Config) -> None:
             prog, fail_reason = _parse_response(response)
 
             if prog is None:
-                island_manager.save_failed(config.funsearch_dir, response, fail_reason, prompt=None)
+                island_manager.save_failed(config.funsearch_dir, response, fail_reason, prompt=prompt)
                 print(f"FAILED ({fail_reason})")
                 continue
 
@@ -255,11 +257,7 @@ def run_evolution(config: Config) -> None:
             score, metrics = score_fn(prog, output_dir=program_dir)
             _write_score(metrics, program_dir)
             print(f"score={score:.4f}  status={metrics['status']}")
-            if k==1:
-                prompt_segments = [x[0] for x in segments]
-                full_prompt = ''.join(prompt_segments)
-                print(f'PROMPT: \n {full_prompt}')
-    
+
         # Prune and deduplicate
         df = island_manager.build_dataframe(config.funsearch_dir)
         for k in range(1, config.n_islands + 1):
@@ -290,9 +288,74 @@ def run_evolution(config: Config) -> None:
 
 def run(config: Config) -> None:
     """Full FunSearch run: seed -> initialise -> evolve."""
-    run_seed_stage(config)
-    initialise_islands(config)
+    if config.use_seed_programs:
+        run_seed_stage(config)
+        initialise_islands(config)
+    else:
+        initialise_islands_from_data(config)
     run_evolution(config)
+
+
+
+def initialise_islands_from_data(config: Config) -> None:
+    """
+    Initialise islands without seed programs.
+
+    Generates n_islands * n_programs_per_generation programs by prompting
+    the LLM with only a scatter plot of the raw data. No human-written
+    seed functions are used — the LLM must infer a suitable model form
+    from the data plot alone.
+
+    The data plot is created by calling load_data.py's plot() function,
+    or generated fresh if it does not already exist.
+    """
+    print("\n=== Seedless initialisation (LLM from data plot) ===")
+
+    data_plot_path = _make_data_plot(config)
+    context = load_context(config.code_dir)
+    score_fn = _load_score_fn(config)
+    rng = np.random.default_rng(config.random_seed)
+
+    caller = LLMCaller(
+        provider=config.provider,
+        model=config.model,
+        temperature=config.temperature_explore,
+    )
+
+    for k in range(1, config.n_islands + 1):
+        island_dir = config.island_dir(k)
+        island_name = f"island_{k}"
+
+        existing = list(island_dir.glob("program_*/score.json")) if island_dir.exists() else []
+        if existing:
+            print(f"  {island_name}: {len(existing)} program(s) already exist, skipping.")
+            continue
+
+        print(f"\n  Initialising {island_name} ...")
+        island_dir.mkdir(parents=True, exist_ok=True)
+
+        for j in range(config.n_programs_per_generation):
+            segments = build_seed_prompt(data_plot_path=data_plot_path, context=context)
+            print(f"    [{island_name}] program {j + 1}/{config.n_programs_per_generation} ...", end=" ", flush=True)
+
+            response = caller.call_interleaved_sync(segments)
+            prog, fail_reason = _parse_response(response)
+
+            if prog is None:
+                # Reconstruct prompt text for saving alongside failure
+                prompt_text = segments[0][0] if segments else ""
+                island_manager.save_failed(config.funsearch_dir, response, fail_reason, prompt=prompt_text)
+                print(f"FAILED ({fail_reason})")
+                continue
+
+            program_name = island_manager.next_program_name(island_dir)
+            program_dir = island_dir / program_name
+            program_dir.mkdir(parents=True, exist_ok=True)
+
+            _write_program(prog, program_dir)
+            score, metrics = score_fn(prog, output_dir=program_dir)
+            _write_score(metrics, program_dir)
+            print(f"score={score:.4f}  status={metrics['status']}")
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +369,51 @@ def _load_score_fn(config: Config):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.evaluate
+
+
+def _make_data_plot(config: Config) -> Path:
+    """
+    Generate a scatter plot of the raw data for use in seedless prompts.
+
+    Calls load_data.py's plot() function if it exists, saving the figure
+    to problems/<n>/data/data_plot.png. Returns the path to the plot.
+
+    If load_data.py has no plot() function, falls back to a simple
+    matplotlib scatter using the data returned by load_data().
+    """
+    import importlib.util
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_path = config.problem_dir / "data" / "data_plot.png"
+    if plot_path.exists():
+        print(f"  Data plot already exists: {plot_path}")
+        return plot_path
+
+    load_data_path = config.code_dir / "load_data.py"
+    spec = importlib.util.spec_from_file_location("load", load_data_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    # Use plot() if the problem defines one, otherwise build a simple scatter
+    if hasattr(module, "plot"):
+        module.plot(save_path=plot_path)
+    else:
+        data = module.load()
+        x, y = data[0], data[1]
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.scatter(x, y, s=12, alpha=0.7, color="steelblue", label="data")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_title("Data")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=120)
+        plt.close(fig)
+
+    print(f"  Data plot saved: {plot_path}")
+    return plot_path
 
 
 def _load_seed_parents(config: Config) -> list[tuple[ProgramStrings, float]]:
@@ -382,22 +490,24 @@ def _write_score(metrics: dict, program_dir: Path) -> None:
 if __name__ == "__main__":
     config = Config(
         problem_dir=Path("problems/sinewave"),
-        n_islands=4,
+        n_islands=6,
         n_programs_per_generation=8,
-        n_generations=20,
-        max_population=12,
+        n_generations=10,
+        max_population=10,
         migrate_every=2,
+        use_seed_programs=False,   # try seedless initialisation
         use_image=True,
         provider="google",
         random_seed=42,
     )
 
     print("FunSearch configuration:")
-    print(f"  Problem     : {config.problem_dir}")
-    print(f"  Islands     : {config.n_islands}")
-    print(f"  Programs/gen: {config.n_programs_per_generation}")
-    print(f"  Generations : {config.n_generations}")
-    print(f"  Use images  : {config.use_image}")
-    print(f"  Provider    : {config.provider}")
+    print(f"  Problem       : {config.problem_dir}")
+    print(f"  Islands       : {config.n_islands}")
+    print(f"  Programs/gen  : {config.n_programs_per_generation}")
+    print(f"  Generations   : {config.n_generations}")
+    print(f"  Use seeds     : {config.use_seed_programs}")
+    print(f"  Use images    : {config.use_image}")
+    print(f"  Provider      : {config.provider}")
 
     run(config)
