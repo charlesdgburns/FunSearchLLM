@@ -17,9 +17,15 @@ API keys are loaded from a .env file:
     ANTHROPIC_API_KEY=...
     GOOGLE_API_KEY=...
 """
+import truststore
+truststore.inject_into_ssl()
 
 import os
 import asyncio
+import sys
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 import base64
 import logging
 from pathlib import Path
@@ -259,7 +265,7 @@ if __name__ == "__main__":
     print(f"Model            : {DEFAULT_MODELS[provider]}\n")
 
     caller = LLMCaller(provider=provider, temperature=0.5)
-    response = caller.call_sync("Reply with exactly three words.")
+    response = caller.call_sync("Love")
 
     if response:
         print(f"Response: {response}")
