@@ -182,7 +182,7 @@ def build_seed_prompt(
     -------
     A single-segment Segments list with the data plot attached.
     """
-    text = context + "\n\n" + SEED_TASK + CODE_GUIDE
+    text = SEED_TASK + CODE_GUIDE
     image = [Path(data_plot_path)] if data_plot_path is not None else None
     return [(text, image)]
 
@@ -200,10 +200,7 @@ def load_context(problem_code_dir: Path) -> str:
     if context_path.exists():
         return context_path.read_text().strip()
     print(f"[prompt_builder] Warning: no prompt_context.txt at {context_path}")
-    return (
-        "You are an AI scientist performing symbolic regression. "
-        "Your goal is to discover a compact mathematical function that fits the data well."
-    )
+    return ("")
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +250,7 @@ if __name__ == "__main__":
         print("\n" + "=" * 60)
         print("EVOLUTION PROMPT — explore, no images")
         print("=" * 60)
-        segs = build_prompt(parents, mode="explore", context=context, use_image=False)
+        segs = build_prompt(parents, mode="explore", context=context, use_image=True)
         for i, (text, imgs) in enumerate(segs):
             print(f"Segment {i+1}: {len(text)} chars | images={imgs}")
 

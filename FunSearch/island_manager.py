@@ -140,7 +140,7 @@ def save_failed(
         (program_dir / "raw_response.txt").write_text(raw_response)
 
     # Write a minimal score.json so build_dataframe can read it
-    metrics = {"status": "failed", "reason": reason, "score": -999.0}
+    metrics = {"status": "failed", "reason": reason, "score": 999.0}
     with open(program_dir / "score.json", "w") as f:
         json.dump(metrics, f, indent=2)
 

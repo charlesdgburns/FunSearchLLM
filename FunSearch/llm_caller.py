@@ -16,18 +16,21 @@ when using build_prompt() from prompt_builder.py.
 API keys are loaded from a .env file:
     ANTHROPIC_API_KEY=...
     GOOGLE_API_KEY=...
+
+Rate limiting
+-------------
+429 RESOURCE_EXHAUSTED responses are retried automatically. The retry delay
+is parsed directly from the error message (e.g. "retry in 23s") and a small
+buffer is added. Falls back to exponential backoff if no delay is parseable.
+Max retries is controlled by MAX_RETRIES (default 6).
 """
-import truststore
-truststore.inject_into_ssl()
 
-import os
 import asyncio
-import sys
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
 import base64
 import logging
+import os
+import re
+import sys
 from pathlib import Path
 from typing import Literal
 
@@ -47,16 +50,21 @@ Provider = Literal["anthropic", "google"]
 
 DEFAULT_MODELS: dict[Provider, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
-    "google": "gemma-3-27b-it", # "gemini-2.5-flash", #
+    "google": "gemma-3-27b-it",
 }
 
 MAX_OUTPUT_TOKENS = 5_000
+MAX_RETRIES = 6          # max attempts before giving up
+RETRY_BUFFER_SECS = 2.0  # extra seconds added on top of the server-suggested delay
 
 
 class LLMCaller:
     """
     Thin async wrapper around Anthropic and Google Gemini APIs.
     Supports multi-image prompts for visual feedback on model fits.
+
+    429 rate-limit errors are retried automatically, waiting the server-
+    suggested delay (plus RETRY_BUFFER_SECS) between attempts.
 
     Parameters
     ----------
@@ -85,51 +93,21 @@ class LLMCaller:
         prompt: str,
         image_paths: list[Path] | None = None,
     ) -> str | None:
-        """
-        Send a prompt with optional images and return the response text.
-
-        Images are appended after the prompt text in the order given.
-        To interleave images with text segments, use call_interleaved().
-
-        Parameters
-        ----------
-        prompt      : text prompt to send
-        image_paths : optional list of PNG image paths to include
-
-        Returns
-        -------
-        Response text, or None on failure.
-        """
         images = _load_images(image_paths)
         if self.provider == "anthropic":
-            return await self._call_anthropic([(prompt, images)])
+            return await self._call_with_retry(self._call_anthropic, [(prompt, images)])
         else:
-            return await self._call_google([(prompt, images)])
+            return await self._call_with_retry(self._call_google, [(prompt, images)])
 
     async def call_interleaved(
         self,
         segments: list[tuple[str, list[Path] | None]],
     ) -> str | None:
-        """
-        Send a prompt built from interleaved text and image segments.
-
-        Each segment is a (text, image_paths) tuple. This allows images to
-        appear between text sections rather than all at the end — useful for
-        associating each evaluation figure with its corresponding program.
-
-        Parameters
-        ----------
-        segments : list of (text, image_paths) tuples. image_paths may be None.
-
-        Returns
-        -------
-        Response text, or None on failure.
-        """
         loaded = [(text, _load_images(paths)) for text, paths in segments]
         if self.provider == "anthropic":
-            return await self._call_anthropic(loaded)
+            return await self._call_with_retry(self._call_anthropic, loaded)
         else:
-            return await self._call_google(loaded)
+            return await self._call_with_retry(self._call_google, loaded)
 
     def call_sync(
         self,
@@ -147,6 +125,40 @@ class LLMCaller:
         return asyncio.run(self.call_interleaved(segments))
 
     # ------------------------------------------------------------------
+    # Retry wrapper
+    # ------------------------------------------------------------------
+
+    async def _call_with_retry(self, fn, *args, **kwargs) -> str | None:
+        """
+        Call fn(*args, **kwargs) and retry on 429 / quota errors.
+
+        Waits the server-suggested delay (parsed from the error message)
+        plus RETRY_BUFFER_SECS. Falls back to exponential backoff
+        (10s, 20s, 40s …) if no delay hint is available.
+        """
+        backoff = 10.0
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as e:
+                if not _is_rate_limit_error(e):
+                    # Non-rate-limit error — log and give up immediately
+                    print(f"[llm_caller] Non-retryable error: {e}")
+                    return None
+
+                suggested = _parse_retry_delay(str(e))
+                wait = (suggested + RETRY_BUFFER_SECS) if suggested else backoff
+                print(
+                    f"[llm_caller] 429 rate limit (attempt {attempt}/{MAX_RETRIES}). "
+                    f"Waiting {wait:.1f}s ..."
+                )
+                await asyncio.sleep(wait)
+                backoff = min(backoff * 2, 120.0)  # cap at 2 minutes
+
+        print(f"[llm_caller] Giving up after {MAX_RETRIES} retries.")
+        return None
+
+    # ------------------------------------------------------------------
     # Provider implementations
     # ------------------------------------------------------------------
 
@@ -156,32 +168,28 @@ class LLMCaller:
     ) -> str | None:
         """
         Build an Anthropic content list from interleaved text/image segments.
-        Images are inserted before their associated text segment.
+        Raises on error so _call_with_retry can catch and classify it.
         """
-        try:
-            content: list[dict] = []
-            for text, images in segments:
-                for img_bytes in images:
-                    content.append({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": base64.b64encode(img_bytes).decode(),
-                        },
-                    })
-                content.append({"type": "text", "text": text})
+        content: list[dict] = []
+        for text, images in segments:
+            for img_bytes in images:
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": base64.b64encode(img_bytes).decode(),
+                    },
+                })
+            content.append({"type": "text", "text": text})
 
-            response = await self._client.messages.create(
-                model=self.model,
-                max_tokens=MAX_OUTPUT_TOKENS,
-                temperature=self.temperature,
-                messages=[{"role": "user", "content": content}],
-            )
-            return response.content[0].text
-        except Exception as e:
-            print(f"[llm_caller] Anthropic error: {e}")
-            return None
+        response = await self._client.messages.create(
+            model=self.model,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            temperature=self.temperature,
+            messages=[{"role": "user", "content": content}],
+        )
+        return response.content[0].text
 
     async def _call_google(
         self,
@@ -189,30 +197,26 @@ class LLMCaller:
     ) -> str | None:
         """
         Build a Google contents list from interleaved text/image segments.
-        Images are inserted before their associated text segment.
+        Raises on error so _call_with_retry can catch and classify it.
         """
-        try:
-            config = types.GenerateContentConfig(
-                temperature=self.temperature,
-                max_output_tokens=MAX_OUTPUT_TOKENS,
-            )
-            contents: list = []
-            for text, images in segments:
-                for img_bytes in images:
-                    contents.append(
-                        types.Part.from_bytes(data=img_bytes, mime_type="image/png")
-                    )
-                contents.append(text)
+        config = types.GenerateContentConfig(
+            temperature=self.temperature,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+        )
+        contents: list = []
+        for text, images in segments:
+            for img_bytes in images:
+                contents.append(
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png")
+                )
+            contents.append(text)
 
-            response = await self._client.aio.models.generate_content(
-                model=self.model,
-                contents=contents,
-                config=config,
-            )
-            return response.text
-        except Exception as e:
-            print(f"[llm_caller] Google error: {e}")
-            return None
+        response = await self._client.aio.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=config,
+        )
+        return response.text
 
     # ------------------------------------------------------------------
     # Client initialisation
@@ -253,19 +257,44 @@ def _load_images(image_paths: list[Path] | None) -> list[bytes]:
     return result
 
 
+def _parse_retry_delay(error_str: str) -> float | None:
+    """
+    Extract the suggested retry delay from a 429 error message.
+
+    Handles formats like:
+      "Please retry in 23.558356064s"
+      "retryDelay: '23s'"
+      "retry_delay { seconds: 23 }"
+    Returns the delay in seconds, or None if unparseable.
+    """
+    # "retry in 23.5s" or "retry in 23s"
+    m = re.search(r'retry[^\d]*(\d+(?:\.\d+)?)\s*s', error_str, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    # plain number of seconds anywhere
+    m = re.search(r'(\d+(?:\.\d+)?)\s*seconds?', error_str, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """Return True if the exception looks like a 429 / quota error."""
+    msg = str(e)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower()
+
+
 # ---------------------------------------------------------------------------
 # Standalone test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import sys
-
     provider = sys.argv[1] if len(sys.argv) > 1 else "google"
     print(f"Testing provider : {provider}")
     print(f"Model            : {DEFAULT_MODELS[provider]}\n")
 
     caller = LLMCaller(provider=provider, temperature=0.5)
-    response = caller.call_sync("Love")
+    response = caller.call_sync("Say hello in one sentence.")
 
     if response:
         print(f"Response: {response}")
