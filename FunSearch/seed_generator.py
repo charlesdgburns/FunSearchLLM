@@ -28,8 +28,6 @@ API keys are read from .env (GOOGLE_API_KEY / ANTHROPIC_API_KEY).
 
 import asyncio
 import importlib.util
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
 
